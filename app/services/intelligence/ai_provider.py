@@ -78,7 +78,7 @@ class MockAIProvider(AIProvider):
         hereditary_hit = "hereditary neuropathy" in text_lower or "hmsn" in text_lower
         peripheral_hit = "peripheral neuropathy" in text_lower
 
-        if cmt_specific_hit or gene_hits:
+        if cmt_specific_hit:
             scope = "cmt_specific"
             cmt_relevance = 90
         elif hereditary_hit:

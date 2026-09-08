@@ -144,6 +144,36 @@ CLINICAL_TRIAL_UPDATED_STATUS = NormalizedRecord(
     raw_metadata={"source": "clinicaltrials.gov", "status": "ACTIVE_NOT_RECRUITING"},
 )
 
+# Rev4 classification guard: CMT-associated gene without CMT disease context.
+GENE_ONLY_MFN2_RESEARCH = NormalizedRecord(
+    external_id="pmid-10000007",
+    canonical_url="https://pubmed.ncbi.nlm.nih.gov/10000007/",
+    title="Mitochondrial dynamics in diabetic retinopathy",
+    authors=["Test Researcher"],
+    journal="Journal of Experimental Medicine",
+    pmid="10000007",
+    publication_date=date(2025, 6, 1),
+    abstract=(
+        "We investigated mitochondrial dysfunction in retinal cells and found that "
+        "MFN2 expression was altered during diabetic stress."
+    ),
+)
+
+# Rev4 classification guard: PMP22 mentioned in another neuromuscular disease.
+GENE_ONLY_PMP22_RESEARCH = NormalizedRecord(
+    external_id="pmid-10000008",
+    canonical_url="https://pubmed.ncbi.nlm.nih.gov/10000008/",
+    title="Schwann cell abnormalities in Duchenne muscular dystrophy",
+    authors=["Test Researcher"],
+    journal="Neuromuscular Disease Journal",
+    pmid="10000008",
+    publication_date=date(2025, 7, 1),
+    abstract=(
+        "We studied Schwann cell abnormalities in Duchenne muscular dystrophy. "
+        "PMP22 expression was reduced in affected peripheral nerves."
+    ),
+)
+
 ALL_RECORDS = [
     CMT_SPECIFIC_RESEARCH,
     CMT_GENETIC_RESEARCH,

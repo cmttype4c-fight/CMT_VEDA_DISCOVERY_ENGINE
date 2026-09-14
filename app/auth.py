@@ -68,3 +68,14 @@ def require_role(*allowed: Role):
 require_admin = require_role(Role.discovery_administrator)
 require_reviewer_or_admin = require_role(Role.reviewer, Role.discovery_administrator)
 require_any_authenticated = require_role(Role.discovery_administrator, Role.reviewer, Role.service)
+
+# Added for the CMT Veda compatibility routes (app/api/routers/*): the
+# gateway authenticates to Platform1 as a `service` principal, trusted to
+# have already done its own authorization of the human CMT Veda user
+# (spec: "CMT Veda should not receive direct database access" -- the
+# gateway is the trust boundary). These widen which principals may call
+# the NEW compatibility routes only; every pre-existing route keeps its
+# original dependency untouched, so direct admin/reviewer use is
+# unaffected and no existing boundary is weakened.
+require_service_or_admin = require_role(Role.service, Role.discovery_administrator)
+require_service_or_reviewer_or_admin = require_role(Role.service, Role.reviewer, Role.discovery_administrator)

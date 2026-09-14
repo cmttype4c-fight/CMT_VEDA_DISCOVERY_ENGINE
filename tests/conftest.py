@@ -86,3 +86,8 @@ def admin_headers():
 @pytest.fixture
 def reviewer_headers():
     return {"Authorization": "Bearer test-reviewer-token"}
+
+
+@pytest.fixture
+def service_headers():
+    return {"Authorization": "Bearer test-service-token"}

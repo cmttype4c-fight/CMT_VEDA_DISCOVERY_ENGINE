@@ -147,6 +147,7 @@ class AuditAction(str, enum.Enum):
     newsletter_approved = "newsletter_approved"
     newsletter_rejected = "newsletter_rejected"
     scheduled = "scheduled"
+    unscheduled = "unscheduled"  # added for CMT Veda compatibility: DELETE .../schedule (see newsletter_workflow.unschedule)
     published = "published"
     rag_submitted = "rag_submitted"
     rag_verified = "rag_verified"

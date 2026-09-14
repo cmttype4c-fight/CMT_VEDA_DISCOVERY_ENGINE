@@ -23,6 +23,7 @@ from app.api.routers import (
     health,
     manual,
     newsletter,
+    overview,
     rag,
     runs,
     sources,
@@ -49,7 +50,7 @@ app = FastAPI(
 # handlers, one OpenAPI schema, one /docs page (spec #55: stable,
 # documented request/response schemas for the future Lovable frontend).
 api_router = APIRouter(prefix=settings.api_prefix)
-for router in (sources, runs, candidates, analysis, editorial, newsletter, rag, manual, audit):
+for router in (sources, runs, candidates, analysis, editorial, newsletter, rag, manual, audit, overview):
     api_router.include_router(router.router)
 
 app.include_router(api_router)

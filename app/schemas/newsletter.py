@@ -53,3 +53,38 @@ class NewsletterPublicationOut(BaseModel):
     item_ids: list[str]
     created_by: str | None = None
     published_by: str | None = None
+
+
+# --- CMT Veda compatibility schemas (app/api/routers/newsletter.py) ---
+# Added for the editorial-status dispatcher and bulk endpoint. Both are
+# thin adapters over the existing select/review/approve/reject/archive
+# functions above -- these schemas carry no new business fields, just
+# the target status (and, for bulk, which candidates).
+
+
+class EditorialStatusTransitionRequest(BaseModel):
+    """Target status for POST .../editorial-status. Value must be one of
+    the existing NewsletterStatus values this dispatcher supports:
+    selected | under_review | approved | rejected | archived. `reason`
+    is required when status == 'rejected' (mirrors NewsletterRejectRequest)."""
+
+    status: str
+    reason: str | None = None
+
+
+class BulkCandidateAction(BaseModel):
+    candidate_ids: list[uuid.UUID] = Field(..., min_length=1)
+    status: str
+    reason: str | None = None
+
+
+class BulkResultItem(BaseModel):
+    candidate_id: uuid.UUID
+    success: bool
+    error: str | None = None
+
+
+class BulkResult(BaseModel):
+    results: list[BulkResultItem]
+    succeeded: int
+    failed: int

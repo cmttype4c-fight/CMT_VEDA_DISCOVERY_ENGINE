@@ -39,7 +39,15 @@ ALLOWED_TRANSITIONS: dict[str, set[str]] = {
         NewsletterStatus.archived.value,
     },
     NewsletterStatus.approved.value: {NewsletterStatus.scheduled.value, NewsletterStatus.archived.value},
-    NewsletterStatus.scheduled.value: {NewsletterStatus.published.value, NewsletterStatus.archived.value},
+    NewsletterStatus.scheduled.value: {
+        NewsletterStatus.published.value,
+        NewsletterStatus.archived.value,
+        # Added for CMT Veda compatibility (DELETE .../schedule ->
+        # unschedule()): the smallest valid edge needed to let a
+        # scheduled item be pulled back for further editing rather than
+        # only ever moving forward to published or terminally archived.
+        NewsletterStatus.approved.value,
+    },
     NewsletterStatus.published.value: {NewsletterStatus.archived.value},
     NewsletterStatus.rejected.value: {NewsletterStatus.archived.value, NewsletterStatus.selected.value},
     NewsletterStatus.archived.value: set(),
@@ -133,6 +141,33 @@ def schedule(
         db, candidate_id=candidate.id, action=AuditAction.scheduled, performed_by=performed_by,
         notes=f"publication_id={publication.id}",
     )
+    return item
+
+
+def unschedule(db: Session, candidate: DiscoveryCandidate, performed_by: str) -> NewsletterItem:
+    """
+    CMT Veda compatibility (`DELETE .../schedule`): pulls a `scheduled`
+    item back to `approved` so it can be edited or rescheduled. This
+    edge did not exist in the original state machine -- the smallest
+    valid addition needed for this one operation is the single
+    `scheduled -> approved` entry in ALLOWED_TRANSITIONS above; nothing
+    else about the state machine changes.
+
+    Also detaches the item from any publication's `item_ids` it was
+    attached to via `schedule()` -- otherwise a later batch-publish of
+    that publication would still reference this item and fail with
+    InvalidTransition, since it is no longer `scheduled`.
+    """
+    item = get_or_create_item(db, candidate)
+    _transition(item, candidate, NewsletterStatus.approved.value)
+    item.scheduled_for = None
+
+    publications = db.execute(select(NewsletterPublication)).scalars().all()
+    for publication in publications:
+        if str(item.id) in publication.item_ids:
+            publication.item_ids = [i for i in publication.item_ids if i != str(item.id)]
+
+    write_audit_log(db, candidate_id=candidate.id, action=AuditAction.unscheduled, performed_by=performed_by)
     return item
 
 

@@ -86,3 +86,74 @@ def test_archive_reachable_from_most_states(db_session):
     wf.select_for_newsletter(db_session, candidate, "reviewer:a")
     wf.archive(db_session, candidate, "admin:a")
     assert candidate.newsletter_status == "archived"
+
+
+# --- unschedule() (CMT Veda compatibility: DELETE .../schedule) ---
+
+
+def test_unschedule_reverts_scheduled_to_approved_and_clears_scheduled_for(db_session):
+    from datetime import datetime, timezone
+
+    candidate = _candidate(db_session)
+    wf.select_for_newsletter(db_session, candidate, "reviewer:a")
+    wf.mark_drafted(db_session, candidate, None)
+    wf.submit_for_review(db_session, candidate, "reviewer:a")
+    wf.approve(db_session, candidate, "admin:a")
+
+    publication = NewsletterPublication(title="Test Issue", status="scheduled")
+    db_session.add(publication)
+    db_session.flush()
+    item = wf.schedule(db_session, candidate, "admin:a", datetime.now(timezone.utc), publication)
+    assert candidate.newsletter_status == "scheduled"
+
+    item = wf.unschedule(db_session, candidate, "admin:a")
+    assert candidate.newsletter_status == "approved"
+    assert item.scheduled_for is None
+
+
+def test_unschedule_detaches_item_from_its_publication(db_session):
+    from datetime import datetime, timezone
+
+    candidate = _candidate(db_session)
+    wf.select_for_newsletter(db_session, candidate, "reviewer:a")
+    wf.mark_drafted(db_session, candidate, None)
+    wf.submit_for_review(db_session, candidate, "reviewer:a")
+    wf.approve(db_session, candidate, "admin:a")
+
+    publication = NewsletterPublication(title="Test Issue", status="scheduled")
+    db_session.add(publication)
+    db_session.flush()
+    item = wf.schedule(db_session, candidate, "admin:a", datetime.now(timezone.utc), publication)
+    assert str(item.id) in publication.item_ids
+
+    wf.unschedule(db_session, candidate, "admin:a")
+    assert str(item.id) not in publication.item_ids
+
+
+def test_unschedule_invalid_when_not_scheduled(db_session):
+    """A candidate that was never scheduled (still not_selected) cannot
+    be unscheduled -- confirms this new edge doesn't accidentally permit
+    unschedule from arbitrary states."""
+    candidate = _candidate(db_session)
+    with pytest.raises(InvalidTransition):
+        wf.unschedule(db_session, candidate, "admin:a")
+
+
+def test_scheduled_can_still_reach_published_after_new_edge_added(db_session):
+    """Regression check: adding scheduled -> approved must not break the
+    pre-existing scheduled -> published edge."""
+    from datetime import datetime, timezone
+
+    candidate = _candidate(db_session)
+    wf.select_for_newsletter(db_session, candidate, "reviewer:a")
+    wf.mark_drafted(db_session, candidate, None)
+    wf.submit_for_review(db_session, candidate, "reviewer:a")
+    wf.approve(db_session, candidate, "admin:a")
+
+    publication = NewsletterPublication(title="Test Issue", status="scheduled")
+    db_session.add(publication)
+    db_session.flush()
+    item = wf.schedule(db_session, candidate, "admin:a", datetime.now(timezone.utc), publication)
+
+    wf.publish(db_session, candidate, item, "admin:a")
+    assert candidate.newsletter_status == "published"

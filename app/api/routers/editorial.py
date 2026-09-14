@@ -8,7 +8,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_candidate_or_404, get_db
-from app.auth import Principal, require_admin, require_any_authenticated, require_reviewer_or_admin
+from app.auth import (
+    Principal,
+    require_admin,
+    require_any_authenticated,
+    require_reviewer_or_admin,
+    require_service_or_reviewer_or_admin,
+)
 from app.models.candidate import DiscoveryCandidate
 from app.models.editorial import DiscoveryEditorialDraft
 from app.schemas.editorial import EditorialDraftOut, EditorialDraftUpdate, EditorialGenerateRequest
@@ -88,3 +94,24 @@ def edit_draft(
     db.commit()
     db.refresh(new_draft)
     return new_draft
+
+
+# --- CMT Veda compatibility route ---
+
+
+@router.patch("/candidates/{candidate_id}/editorial", response_model=EditorialDraftOut)
+def edit_draft_compat(
+    payload: EditorialDraftUpdate,
+    candidate: DiscoveryCandidate = Depends(get_candidate_or_404),
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(require_service_or_reviewer_or_admin),
+):
+    """
+    Thin CMT Veda compatibility alias for `PATCH .../editorial-draft`
+    above. Calls that exact function directly -- zero duplicated
+    persistence logic, per the instruction. The original
+    `/editorial-draft` path and its own `require_reviewer_or_admin`
+    dependency are unchanged; this new path additionally accepts the
+    `service` role so the CMT Veda gateway can call it.
+    """
+    return edit_draft(payload, candidate=candidate, db=db, principal=principal)

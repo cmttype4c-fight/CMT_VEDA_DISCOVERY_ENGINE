@@ -470,6 +470,162 @@ async def test_acquire_full_text_corrects_mislabeled_format(db_session, tmp_path
     assert "Actually an HTML error" in doc.extracted_text
 
 
+# --- EUROPE PMC FULL-TEXT CORRECTION: PDF -> official XML fallback ---
+
+_PMC_XML_BODY = (
+    b"<?xml version='1.0' encoding='UTF-8'?>"
+    b"<article><body><p>Real full-text XML content for a CMT paper, standing in for "
+    b"what the official Europe PMC fullTextXML endpoint actually returned during this "
+    b"pass's VPS testing against four live PMCIDs.</p></body></article>"
+)
+
+_PDF_403_AND_PMCID_RESPONSE = {
+    "resultList": {
+        "result": [
+            {
+                "id": "39000001", "source": "MED", "pmid": "39000001",
+                "doi": "10.1000/cmt-pdf-blocked", "title": "A CMT paper whose PDF render URL is blocked",
+                "isOpenAccess": "Y", "pmcid": "PMC13571996",
+                "fullTextUrlList": {
+                    "fullTextUrl": [
+                        {"documentStyle": "pdf", "url": "https://europepmc.org/articles/PMC13571996?pdf=render"},
+                        {"documentStyle": "html", "url": "https://europepmc.org/article/MED/39000001"},
+                    ]
+                },
+            }
+        ]
+    },
+    "nextCursorMark": None,
+}
+
+
+@respx.mock
+async def test_resolve_full_text_offers_official_fulltextxml_endpoint_even_without_xml_style(db_session):
+    """The core of this correction: the official
+    https://www.ebi.ac.uk/europepmc/webservices/rest/{PMCID}/fullTextXML
+    endpoint must be offered as the XML candidate purely from the
+    result's `pmcid`, even though this fixture's own `fullTextUrlList`
+    lists no 'xml' documentStyle entry at all."""
+    respx.route(method="GET", host="www.ebi.ac.uk").mock(
+        return_value=httpx.Response(200, json=_PDF_403_AND_PMCID_RESPONSE)
+    )
+    candidate = _candidate(pmid="39000001", doi="10.1000/cmt-pdf-blocked")
+    result = await resolve_full_text(candidate)
+    assert result.available is True
+    formats = [c.full_text_format for c in result.candidates]
+    assert formats == ["pdf", "xml", "html"]
+    xml_candidate = result.candidates[1]
+    assert xml_candidate.url == "https://www.ebi.ac.uk/europepmc/webservices/rest/PMC13571996/fullTextXML"
+    assert xml_candidate.full_text_source == "europepmc_fulltextxml_api"
+
+
+@respx.mock
+async def test_pdf_403_falls_through_to_official_fulltextxml_and_succeeds(db_session, tmp_path, monkeypatch):
+    """THE regression test this correction explicitly requires: 'PDF
+    unavailable/403 -> official Europe PMC fullTextXML -> successful
+    document + extracted text.' Reproduces exactly what real VPS testing
+    found this pass: the PDF render URL 403s, the official fullTextXML
+    endpoint (keyed by PMCID) returns 200 with real article XML -- and
+    this must NOT be a terminal candidate failure."""
+    from app.services.fulltext import service as service_module
+    from app.services.fulltext.storage import LocalDiskDocumentStorage as _LocalStorage
+
+    monkeypatch.setattr(service_module, "get_document_storage", lambda: _LocalStorage(str(tmp_path)))
+
+    respx.route(method="GET", host="www.ebi.ac.uk", path="/europepmc/webservices/rest/search").mock(
+        return_value=httpx.Response(200, json=_PDF_403_AND_PMCID_RESPONSE)
+    )
+    respx.route(method="GET", url="https://europepmc.org/articles/PMC13571996?pdf=render").mock(
+        return_value=httpx.Response(403, text="Forbidden")
+    )
+    respx.route(
+        method="GET",
+        url="https://www.ebi.ac.uk/europepmc/webservices/rest/PMC13571996/fullTextXML",
+    ).mock(return_value=httpx.Response(200, content=_PMC_XML_BODY, headers={"content-type": "application/xml"}))
+
+    candidate = _candidate(pmid="39000001", doi="10.1000/cmt-pdf-blocked")
+    db_session.add(candidate)
+    db_session.flush()
+
+    doc = await acquire_full_text(db_session, candidate)
+
+    assert doc.retrieval_status == "acquired"
+    assert doc.full_text_format == "xml"  # stored format: pdf -> pdf, xml -> xml, html -> html
+    assert doc.pdf_available is False  # must remain False when XML is used
+    assert doc.full_text_source == "europepmc_fulltextxml_api"
+    assert doc.document_url == "https://www.ebi.ac.uk/europepmc/webservices/rest/PMC13571996/fullTextXML"
+    assert doc.extraction_status == "success"
+    assert doc.extracted_text is not None
+    assert "Real full-text XML content" in doc.extracted_text
+    assert doc.extracted_char_count == len(doc.extracted_text)
+    assert candidate.full_text_available is True  # must become True from valid XML, never abstract-only
+
+
+@respx.mock
+async def test_pdf_success_does_not_fall_through_to_xml_or_html(db_session, tmp_path, monkeypatch):
+    """Sanity check in the other direction: when the PDF genuinely
+    downloads successfully, the XML/HTML candidates are never even
+    attempted -- PDF stays the top priority when it is truly accessible."""
+    from app.services.fulltext import service as service_module
+    from app.services.fulltext.storage import LocalDiskDocumentStorage as _LocalStorage
+
+    monkeypatch.setattr(service_module, "get_document_storage", lambda: _LocalStorage(str(tmp_path)))
+
+    respx.route(method="GET", host="www.ebi.ac.uk", path="/europepmc/webservices/rest/search").mock(
+        return_value=httpx.Response(200, json=_PDF_403_AND_PMCID_RESPONSE)
+    )
+    pdf_route = respx.route(method="GET", url="https://europepmc.org/articles/PMC13571996?pdf=render").mock(
+        return_value=httpx.Response(200, content=b"%PDF-1.4 genuine pdf bytes", headers={"content-type": "application/pdf"})
+    )
+    xml_route = respx.route(
+        method="GET", url="https://www.ebi.ac.uk/europepmc/webservices/rest/PMC13571996/fullTextXML"
+    ).mock(return_value=httpx.Response(200, content=_PMC_XML_BODY))
+
+    candidate = _candidate(pmid="39000001", doi="10.1000/cmt-pdf-blocked")
+    db_session.add(candidate)
+    db_session.flush()
+
+    doc = await acquire_full_text(db_session, candidate)
+
+    assert doc.full_text_format == "pdf"
+    assert doc.pdf_available is True
+    assert xml_route.call_count == 0  # never attempted -- PDF succeeded first
+
+
+@respx.mock
+async def test_both_pdf_and_xml_fail_falls_through_to_html(db_session, tmp_path, monkeypatch):
+    """Full three-deep fallback: PDF 403s, the official XML endpoint also
+    fails, HTML is the last legitimate fallback and is used."""
+    from app.services.fulltext import service as service_module
+    from app.services.fulltext.storage import LocalDiskDocumentStorage as _LocalStorage
+
+    monkeypatch.setattr(service_module, "get_document_storage", lambda: _LocalStorage(str(tmp_path)))
+
+    respx.route(method="GET", host="www.ebi.ac.uk", path="/europepmc/webservices/rest/search").mock(
+        return_value=httpx.Response(200, json=_PDF_403_AND_PMCID_RESPONSE)
+    )
+    respx.route(method="GET", url="https://europepmc.org/articles/PMC13571996?pdf=render").mock(
+        return_value=httpx.Response(403, text="Forbidden")
+    )
+    respx.route(
+        method="GET", url="https://www.ebi.ac.uk/europepmc/webservices/rest/PMC13571996/fullTextXML"
+    ).mock(return_value=httpx.Response(404, text="Not Found"))
+    respx.route(method="GET", url="https://europepmc.org/article/MED/39000001").mock(
+        return_value=httpx.Response(200, content=b"<html><body>full text</body></html>", headers={"content-type": "text/html"})
+    )
+
+    candidate = _candidate(pmid="39000001", doi="10.1000/cmt-pdf-blocked")
+    db_session.add(candidate)
+    db_session.flush()
+
+    doc = await acquire_full_text(db_session, candidate)
+
+    assert doc.retrieval_status == "acquired"
+    assert doc.full_text_format == "html"
+    assert doc.pdf_available is False
+    assert candidate.full_text_available is True
+
+
 @respx.mock
 async def test_acquire_full_text_populates_extraction_fields(db_session, tmp_path, monkeypatch):
     """FINAL CORRECTIVE PROMPT #1: acquisition must actually extract

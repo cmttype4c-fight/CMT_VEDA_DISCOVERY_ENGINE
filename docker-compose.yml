@@ -1,0 +1,68 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: discovery
+      POSTGRES_PASSWORD: discovery
+      POSTGRES_DB: discovery_engine
+    ports:
+      - "5432:5432"
+    volumes:
+      - discovery_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U discovery -d discovery_engine"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    build: .
+    command: alembic upgrade head
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://discovery:discovery@postgres:5432/discovery_engine
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  discovery-api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://discovery:discovery@postgres:5432/discovery_engine
+    ports:
+      - "8000:8000"
+    volumes:
+      - discovery_documents_data:/data/discovery-documents
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  discovery-worker:
+    build: .
+    command: python -m app.worker.worker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://discovery:discovery@postgres:5432/discovery_engine
+    volumes:
+      - discovery_documents_data:/data/discovery-documents
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  discovery_pg_data:
+  # Full-text document storage (CMT-specific overhaul, Phase 5/6/corrective
+  # prompt #11): named volume shared between discovery-api and
+  # discovery-worker so acquired full text survives container
+  # recreation/redeployment and both services see the same files.
+  # FULLTEXT_STORAGE_DIR defaults to this same path (app/config.py); if an
+  # environment overrides FULLTEXT_STORAGE_DIR to something else, update
+  # this mount path to match. This is the base docker-compose.yml only --
+  # the VPS's docker-compose.override.yml (port bindings) is untouched.
+  discovery_documents_data:

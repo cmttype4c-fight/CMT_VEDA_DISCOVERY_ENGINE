@@ -94,6 +94,49 @@ def mark_drafted(db: Session, candidate: DiscoveryCandidate, editorial_draft_id:
     return item
 
 
+def mark_draft_saved_manually(
+    db: Session, candidate: DiscoveryCandidate, editorial_draft_id: uuid.UUID, performed_by: str,
+) -> NewsletterItem:
+    """
+    Manual-save counterpart to `mark_drafted` above (CMT Veda "Save Draft"
+    fix). A human editor saving a draft via `PATCH .../editorial-draft` (or
+    its `PATCH .../editorial` compatibility alias) must have the same
+    selected -> drafted effect that the automated worker pipeline already
+    gets when it calls `mark_drafted` -- otherwise a manually-saved draft
+    never associates with the `NewsletterItem` and the candidate is stuck
+    showing `selected` forever.
+
+    Deliberately NOT a call to `mark_drafted` itself, for two reasons:
+
+    1. Audit accuracy: `mark_drafted` hardcodes
+       `performed_by="veda_intelligence"` and `action=AuditAction.draft_generated`
+       unconditionally, which is correct for the AI/automated path but would
+       be a false audit record for a human editor's manual save. This
+       function instead uses the real `performed_by` (the authenticated
+       principal who called the PATCH endpoint) and `AuditAction.edited`
+       (an action already defined on the enum but, until this fix, never
+       used anywhere -- exactly the "appropriate event for the draft being
+       saved/associated" the fix calls for, kept distinct from the AI
+       path's `draft_generated` semantics).
+    2. Same transition guard as `mark_drafted`: only `selected -> drafted`
+       is performed, and only when the item is currently `selected`. If the
+       item is already `drafted` (re-saving a draft), already
+       `under_review`, `approved`, `scheduled`, or `published`, this is a
+       no-op with respect to `status` -- it never regresses a later state
+       and never reaches into `_transition`/`ALLOWED_TRANSITIONS` for any
+       other edge. The association (`editorial_draft_id`) is always
+       refreshed regardless of status, since pointing at the latest saved
+       draft is a simple association, not a state transition, and is safe
+       to update no matter what stage review has reached.
+    """
+    item = get_or_create_item(db, candidate)
+    if item.status == NewsletterStatus.selected.value:
+        _transition(item, candidate, NewsletterStatus.drafted.value)
+    item.editorial_draft_id = editorial_draft_id
+    write_audit_log(db, candidate_id=candidate.id, action=AuditAction.edited, performed_by=performed_by)
+    return item
+
+
 def submit_for_review(db: Session, candidate: DiscoveryCandidate, performed_by: str) -> NewsletterItem:
     item = get_or_create_item(db, candidate)
     _transition(item, candidate, NewsletterStatus.under_review.value)

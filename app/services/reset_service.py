@@ -60,6 +60,7 @@ command to run manually, immediately before calling `execute_reset`.
 """
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 
 from sqlalchemy import delete, func, select
@@ -157,3 +158,199 @@ def execute_reset(db: Session, *, confirm: bool) -> ResetResult:
     verified_clean = post_counts.total == 0
 
     return ResetResult(pre_counts=pre_counts, post_counts=post_counts, verified_clean=verified_clean)
+
+
+# ===========================================================================
+# Selective reset: "clean the candidate dataset but keep ONE candidate" --
+# a deliberately narrower sibling of execute_reset() above, added for the
+# "Simplify Discovery Newsletter Workflow and Clean Dataset" task.
+#
+# Scope is intentionally NOT the same as execute_reset()'s full wipe:
+#
+#   DELETED, for every candidate EXCEPT the retained one:
+#       newsletter_items, rag_ingestion_requests, discovery_editorial_drafts,
+#       discovery_analysis, discovery_documents, discovery_source_records,
+#       discovery_candidates
+#
+#   NEVER TOUCHED (deliberately out of scope for a "clean the CANDIDATE
+#   dataset" operation, unlike the full reset above):
+#       discovery_sources      -- source/collector CONFIGURATION, not
+#                                  candidate data; removing a source
+#                                  definition was never asked for.
+#       discovery_runs         -- collection RUN history, tied to a
+#                                  source, not a candidate; multiple
+#                                  candidates/source_records can derive
+#                                  from the same run, so it is not
+#                                  "the candidate's" to delete.
+#       discovery_jobs         -- worker queue history; has no
+#                                  candidate_id column at all (confirmed
+#                                  by reading app/models/job.py).
+#       discovery_audit_log    -- same reasoning as execute_reset(): no
+#                                  FK to candidates (by design, see
+#                                  app/models/audit.py), and an audit
+#                                  trail is meant to survive the data it
+#                                  describes being removed.
+#       discovery_taxonomy     -- admin-configured vocabulary, unrelated
+#                                  to any specific candidate.
+#       newsletter_publications -- a publication record is real
+#                                  newsletter-issue history; it is not
+#                                  itself tied to one candidate_id (its
+#                                  `item_ids` is a plain JSON list with no
+#                                  DB-level FK -- confirmed by reading
+#                                  app/models/newsletter.py), and deleting
+#                                  newsletter_items for removed candidates
+#                                  cannot violate any constraint on it.
+#
+# `discovery_source_records.candidate_id` is NULLABLE (a record that was
+# collected but never promoted to a candidate during dedup/validation) --
+# those orphaned rows are deleted too (candidate_id IS NULL), since they
+# are still part of "the current candidate dataset" being cleaned and
+# cannot belong to the retained candidate.
+# ===========================================================================
+
+_SELECTIVE_TABLES_IN_DELETE_ORDER: list[tuple[str, type]] = [
+    ("newsletter_items", NewsletterItem),
+    ("rag_ingestion_requests", RagIngestionRequest),
+    ("discovery_editorial_drafts", DiscoveryEditorialDraft),
+    ("discovery_analysis", DiscoveryAnalysis),
+    ("discovery_documents", DiscoveryDocument),
+    ("discovery_source_records", DiscoverySourceRecord),
+    ("discovery_candidates", DiscoveryCandidate),
+]
+
+_SELECTIVE_PRESERVED_TABLES = [
+    "discovery_sources", "discovery_runs", "discovery_jobs", "discovery_taxonomy",
+    "discovery_audit_log", "newsletter_publications",
+    "alembic_version (schema/migrations)", "auth/configuration (not a table -- env vars)",
+]
+
+
+def _normalize_candidate_id(retain_candidate_id: uuid.UUID | str) -> uuid.UUID:
+    return retain_candidate_id if isinstance(retain_candidate_id, uuid.UUID) else uuid.UUID(str(retain_candidate_id))
+
+
+@dataclass
+class SelectiveResetCounts:
+    """`deleted` is "how many rows in this table do NOT belong to the
+    retained candidate" (i.e. what a real run would remove); `retained`
+    is "how many rows belong to the retained candidate" (what survives).
+    Both are always safe, read-only counts."""
+
+    retain_candidate_id: uuid.UUID
+    retained_candidate_exists: bool
+    deleted: dict[str, int] = field(default_factory=dict)
+    retained: dict[str, int] = field(default_factory=dict)
+    preserved: list[str] = field(default_factory=lambda: list(_SELECTIVE_PRESERVED_TABLES))
+
+    @property
+    def total_to_delete(self) -> int:
+        return sum(self.deleted.values())
+
+
+def dry_run_selective_counts(db: Session, retain_candidate_id: uuid.UUID | str) -> SelectiveResetCounts:
+    """Read-only. Always safe to call. Shows exactly what
+    execute_selective_reset() would delete vs. retain, without changing
+    anything -- run this first, same discipline as dry_run_counts()."""
+    retain_id = _normalize_candidate_id(retain_candidate_id)
+    retained_candidate_exists = db.get(DiscoveryCandidate, retain_id) is not None
+
+    deleted: dict[str, int] = {}
+    retained: dict[str, int] = {}
+    for table_name, model in _SELECTIVE_TABLES_IN_DELETE_ORDER:
+        if model is DiscoveryCandidate:
+            deleted[table_name] = db.execute(
+                select(func.count()).select_from(model).where(model.id != retain_id)
+            ).scalar_one()
+            retained[table_name] = db.execute(
+                select(func.count()).select_from(model).where(model.id == retain_id)
+            ).scalar_one()
+        elif model is DiscoverySourceRecord:
+            # Nullable FK: "not the retained candidate" includes rows
+            # that never became any candidate at all.
+            deleted[table_name] = db.execute(
+                select(func.count()).select_from(model).where(
+                    (model.candidate_id.is_(None)) | (model.candidate_id != retain_id)
+                )
+            ).scalar_one()
+            retained[table_name] = db.execute(
+                select(func.count()).select_from(model).where(model.candidate_id == retain_id)
+            ).scalar_one()
+        else:
+            deleted[table_name] = db.execute(
+                select(func.count()).select_from(model).where(model.candidate_id != retain_id)
+            ).scalar_one()
+            retained[table_name] = db.execute(
+                select(func.count()).select_from(model).where(model.candidate_id == retain_id)
+            ).scalar_one()
+
+    return SelectiveResetCounts(
+        retain_candidate_id=retain_id, retained_candidate_exists=retained_candidate_exists,
+        deleted=deleted, retained=retained,
+    )
+
+
+@dataclass
+class SelectiveResetResult:
+    pre_counts: SelectiveResetCounts
+    post_counts: SelectiveResetCounts
+    verified_clean: bool  # True iff exactly the retained candidate (and only its own rows) remain
+
+
+def execute_selective_reset(db: Session, *, retain_candidate_id: uuid.UUID | str, confirm: bool) -> SelectiveResetResult:
+    """
+    DESTRUCTIVE. Deletes every row in every table listed in
+    _SELECTIVE_TABLES_IN_DELETE_ORDER that does NOT belong to
+    `retain_candidate_id`, leaving that one candidate (and only its own
+    dependent rows) in place. Never call this without:
+
+      1. A verified backup already taken (same standing requirement as
+         execute_reset() -- this function has no OS/shell access to the
+         database host and cannot take one itself).
+      2. Having already reviewed dry_run_selective_counts(db, ...).
+      3. Explicit human sign-off for this specific run.
+
+    Refuses to run (raises ValueError, touches nothing) if:
+      - confirm is not True.
+      - `retain_candidate_id` does not exist as a DiscoveryCandidate --
+        this is a deliberate safety rail: without it, a mistyped/stale
+        UUID would silently fall through to "nothing matches, so keep
+        nothing", deleting every candidate instead of all-but-one.
+
+    Runs as a single transaction, same as execute_reset(): the caller's
+    session_scope() (or equivalent) commits only if this function returns
+    normally, and rolls back entirely if anything raises.
+    """
+    if not confirm:
+        raise ValueError(
+            "execute_selective_reset() called without confirm=True -- refusing to run. "
+            "Call dry_run_selective_counts(db, retain_candidate_id) first, review it, "
+            "take a backup, then call execute_selective_reset(db, retain_candidate_id=..., confirm=True) explicitly."
+        )
+
+    retain_id = _normalize_candidate_id(retain_candidate_id)
+    if db.get(DiscoveryCandidate, retain_id) is None:
+        raise ValueError(
+            f"Refusing to run: no DiscoveryCandidate with id={retain_id} exists. "
+            "execute_selective_reset() requires the candidate to be retained to already exist -- "
+            "otherwise every candidate would be deleted with none retained."
+        )
+
+    pre_counts = dry_run_selective_counts(db, retain_id)
+
+    for table_name, model in _SELECTIVE_TABLES_IN_DELETE_ORDER:
+        if model is DiscoveryCandidate:
+            db.execute(delete(model).where(model.id != retain_id))
+        elif model is DiscoverySourceRecord:
+            db.execute(delete(model).where((model.candidate_id.is_(None)) | (model.candidate_id != retain_id)))
+        else:
+            db.execute(delete(model).where(model.candidate_id != retain_id))
+    db.flush()
+
+    post_counts = dry_run_selective_counts(db, retain_id)
+    verified_clean = (
+        post_counts.total_to_delete == 0
+        and post_counts.retained_candidate_exists
+        and post_counts.retained.get("discovery_candidates") == 1
+    )
+
+    return SelectiveResetResult(pre_counts=pre_counts, post_counts=post_counts, verified_clean=verified_clean)

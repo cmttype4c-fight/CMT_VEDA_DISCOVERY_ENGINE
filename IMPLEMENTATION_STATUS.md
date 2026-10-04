@@ -1,6 +1,119 @@
 # Implementation Status
 
-## Manual Editorial Draft Save Workflow fix (this revision, latest)
+## Simplify Discovery Newsletter Workflow and Clean Dataset (this revision, latest)
+
+Four-part task, Discovery Engine only (Veda-v1/CMT Veda frontend untouched,
+confirmed): (1) remove Auto-Pilot, (2) clean the candidate dataset, (3)
+retain candidate `4952752b-42a2-4b33-939c-94e445c36b8c` for testing, (4) keep
+full-text acquisition + every API the Veda-v1 Admin Console uses, without
+touching candidate-selection/relevance logic, RAG code, or adding new
+workflow complexity.
+
+### 1. Auto-Pilot removal
+
+Investigated first, before writing anything: a repo-wide, case-insensitive
+grep across `app/`, `tests/`, and `alembic/` for `autopilot`, `auto_pilot`,
+`auto-pilot`, `AutoPilot`, plus `auto_approve`, `auto_schedule`, and any
+threshold-based auto-promotion logic in the worker, returned **zero
+matches**. The only three "automatic" things that exist anywhere in this
+backend are: (a) the IST source-collection scheduler
+(`app/worker/ist_scheduler.py` / `scheduler.py`, unrelated -- decides when
+to run a *collector*, never touches newsletter/RAG state), (b) the AI
+worker reaching `drafted` via `mark_drafted()` (spec #22/23: AI is
+explicitly barred from reaching `approved`/`scheduled`/`published` on its
+own, enforced in `app/services/workflows/newsletter_workflow.py`), and (c)
+the stuck-job timeout in `app/worker/job_queue.py` (nothing to do with
+candidates at all). **There was no Auto-Pilot implementation in the
+Discovery Engine to remove.**
+
+Cross-checked against the attached `veda-v1-main` frontend
+(`src/lib/discovery-api.server.ts::getAutoPilot`/`setAutoPilot`): it already
+calls `GET/PUT /autopilot` (falling back to `/auto-pilot`, `/settings/autopilot`)
+defensively, and on a `DiscoveryContractGapError` (404/405 -- endpoint
+doesn't exist) it already returns `AUTO_PILOT_UNSUPPORTED` rather than
+erroring. The UI was already built assuming the backend might not support
+Auto-Pilot at all, which is exactly the Discovery Engine's actual, unchanged
+state. No backend code needed to change, and none did.
+
+### 2-4. Dataset cleanup: candidates, retain one
+
+**No live database or VPS access from this sandbox (standing constraint
+across this entire engagement)** -- so this pass adds the safe,
+reviewed-before-run tool to *perform* the cleanup, rather than performing it
+directly. The user runs it against their real database; see "Deployment
+commands" in the task report for the exact invocation.
+
+- **`app/services/reset_service.py`** -- added `dry_run_selective_counts()`
+  and `execute_selective_reset()` alongside the existing (unmodified)
+  `dry_run_counts()`/`execute_reset()` full-wipe pair. Same safety
+  discipline: read-only dry run first, `confirm=True` required (keyword-only,
+  never a default), single transaction, FK-respecting delete order (children
+  before parents). Deletes, for every candidate *except* the one retained:
+  `newsletter_items`, `rag_ingestion_requests`, `discovery_editorial_drafts`,
+  `discovery_analysis`, `discovery_documents`, `discovery_source_records`
+  (including orphaned records with `candidate_id IS NULL` -- never promoted
+  to any candidate), `discovery_candidates`. Refuses (raises `ValueError`,
+  touches nothing) if the named candidate doesn't exist -- a mistyped UUID
+  must never silently become "delete everything."
+
+  Deliberately narrower scope than the existing full `execute_reset()`:
+  `discovery_sources` (collector configuration), `discovery_runs`
+  (collection-run history, tied to a source, not a candidate),
+  `discovery_jobs` (no `candidate_id` column at all), `discovery_taxonomy`,
+  and `discovery_audit_log` (no FK to candidates, by design -- an audit
+  trail outlives the data it describes) are all left completely untouched,
+  for *every* candidate, kept or removed. This cleans "the candidate
+  dataset" as asked, not collection/run history that was never part of the
+  request.
+
+- **`scripts/clean_dataset.py`** (new) -- the deployment-facing CLI: dry run
+  by default, `--confirm` to actually delete, prints exactly what would be
+  deleted/retained either way, non-zero exit on refusal or an unverified
+  post-state.
+
+- **`tests/test_reset_service.py`** -- 6 new tests alongside the existing,
+  unmodified reset tests: dry-run counts reflect the delete/retain split;
+  refuses without `confirm=True`; refuses for a nonexistent candidate id;
+  the real run keeps only the named candidate (and only its own dependent
+  rows) across every touched table; orphaned source records are removed;
+  sources/runs/jobs/taxonomy/audit survive untouched for *both* the kept and
+  the removed candidate (confirms the deliberate scope difference from the
+  full reset).
+
+### Verification performed this pass
+
+No `pytest`/`sqlalchemy` in this sandbox (as every prior pass), so: a full
+repository `py_compile` sweep passed clean, and a genuine, non-mocked
+execution harness (`importlib` + minimal `sqlalchemy` stand-in with real
+boolean-condition semantics, same technique as every prior pass) loaded the
+**real, unmodified-on-disk** `app/services/reset_service.py` and exercised
+`dry_run_selective_counts`/`execute_selective_reset` directly against an
+in-memory two-candidate-plus-orphan-record fixture. **30/30 genuine checks
+passed**, including: correct delete/retain counts, both refusal paths
+(`confirm=False`, nonexistent candidate), the real run leaving exactly one
+candidate with only its own rows across every table, orphan cleanup, and
+confirmed non-interference with `discovery_runs`/`discovery_jobs`.
+
+The acceptance criterion "confirm one test candidate remains" cannot be
+verified against a live database from this sandbox; it is proven against
+the real code via the harness above, and the exact command to verify it
+against the real database is in the task report's "Deployment commands."
+
+### Explicitly NOT done / NOT changed (per instructions)
+
+No RAG code touched (`app/api/routers/rag.py`, `rag_adapter.py`,
+`rag_workflow.py`, `models/rag.py` all unmodified). No change to
+candidate-selection/relevance logic (`analysis.py`, `candidates.py`
+unmodified). No change to full-text acquisition
+(`app/services/fulltext/*` unmodified). No router/endpoint added, removed,
+or changed -- every API the Veda-v1 Admin Console uses is exactly as it was.
+No new workflow/state machine introduced -- `execute_selective_reset` is a
+one-shot data-cleanup utility, not a workflow. Veda-v1 (CMT Veda frontend)
+not modified.
+
+---
+
+## Manual Editorial Draft Save Workflow fix (previous revision)
 
 Bug report: CMT Veda's "Save Draft" button calls
 `PATCH /candidates/{candidate_id}/editorial` (the compatibility route for

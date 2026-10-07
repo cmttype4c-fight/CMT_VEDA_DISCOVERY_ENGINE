@@ -66,7 +66,7 @@ app/
   api/
     routers/        One router per resource (sources, runs, candidates,
                      analysis, editorial, newsletter, rag, manual, audit,
-                     health)
+                     health, document, workspace)
   main.py           FastAPI app assembly
   auth.py           Role-based auth hooks (placeholder until real
                      CMT Veda auth is integrated)
@@ -231,8 +231,15 @@ schema at `/openapi.json` once running — this **is** the frontend
 contract the Lovable app will be built against.
 
 Resource routers: `sources`, `runs`, `candidates` (filter/search/
-paginate), `analysis`, `editorial`, `newsletter`, `rag`, `manual-
-discovery`, `audit`, plus unversioned `/health` and `/readiness`.
+paginate -- accepts either `limit`/`offset` or Veda-style `page`/
+`page_size`), `analysis`, `editorial`, `newsletter` (includes
+`newsletter/section`, `newsletter/publish-now`, and the public
+`newsletter/published` feed), `rag`, `manual-discovery`, `audit`,
+`document` (`GET /candidates/{id}/document`, `GET /documents/{id}` --
+the original full-text record), `workspace` (`GET /candidates/{id}/
+workspace` -- consolidated candidate detail for Veda-v1), plus
+unversioned `/health` and `/readiness`. See `docs/API_CONTRACTS.md`
+for the full, frozen contract Veda-v1 is built against.
 
 Auth: bearer tokens mapped to roles (`discovery_administrator`,
 `reviewer`, `service`) via `AUTH_ADMIN_TOKENS` / `AUTH_REVIEWER_TOKENS` /

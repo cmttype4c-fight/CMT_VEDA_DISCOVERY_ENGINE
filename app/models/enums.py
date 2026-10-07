@@ -105,6 +105,31 @@ class NewsletterStatus(str, enum.Enum):
     archived = "archived"
 
 
+#: CMT Veda final-contract pass (spec item 3 -- "resolve the status
+#: terminology mismatch: Veda UI uses `draft`, Discovery uses `drafted`.
+#: Do not leave this to compatibility guessing.")
+#:
+#: RESOLUTION (documented, not guessed): `NewsletterStatus.drafted` ("drafted")
+#: remains the one canonical value -- it is what `newsletter_items.status`
+#: and `discovery_candidates.newsletter_status` actually store, and it is
+#: not renamed by this pass (renaming a persisted state-machine value is a
+#: data-rewrite / state-machine risk explicitly out of scope here, see
+#: IMPLEMENTATION_STATUS.md). Veda-v1 must adopt `"drafted"` as the literal
+#: it displays/compares against -- this is the one documented requirement
+#: handed to Veda-v1/Lovable for this item.
+#:
+#: As a non-breaking courtesy (not a silent guess), `GET /candidates`'s
+#: `newsletter_status` filter additionally accepts the alias key(s) below
+#: and normalizes them to the canonical value before filtering -- so a
+#: client that still sends `draft` keeps working. This is the ONLY place
+#: the alias applies; it is never written back to storage and never
+#: returned by any response (every output always uses the canonical
+#: `NewsletterStatus` value). See app/api/routers/candidates.py.
+NEWSLETTER_STATUS_INPUT_ALIASES: dict[str, str] = {
+    "draft": NewsletterStatus.drafted.value,
+}
+
+
 class RagStatus(str, enum.Enum):
     not_selected = "not_selected"
     pending_approval = "pending_approval"
@@ -167,6 +192,12 @@ class AuditAction(str, enum.Enum):
     removed = "removed"
     archived = "archived"
     override = "override"
+    # CMT Veda final-contract pass (spec item 9 -- "persistent Newsletter
+    # distribution"): written by newsletter_workflow.set_section() when a
+    # NewsletterItem's section/destination is set. Deliberately distinct
+    # from `edited` -- this is metadata placement, not a content edit or
+    # a state-machine transition.
+    section_assigned = "section_assigned"
 
 
 class Role(str, enum.Enum):

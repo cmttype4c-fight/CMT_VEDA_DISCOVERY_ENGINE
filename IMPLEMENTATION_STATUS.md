@@ -1,6 +1,248 @@
 # Implementation Status
 
-## Simplify Discovery Newsletter Workflow and Clean Dataset (this revision, latest)
+## CMT Veda -- Discovery Engine: Final Functional Requirements (this revision, latest)
+
+Final-contract pass for the Discovery Engine <-> Veda-v1 integration, Discovery
+Engine only -- the RAG implementation (separate "Building CMT Veda AI RAG
+model" section) is untouched: confirmed by diff against the previously
+delivered copy, `app/api/routers/rag.py`, `app/services/rag_adapter.py`,
+`app/services/workflows/rag_workflow.py`, and `app/models/rag.py` are all
+byte-identical to what you already have.
+
+Addressed per the spec's 14 numbered items:
+
+### 1. Discovery workflow -- unchanged, confirmed
+
+`Sources -> Collect -> Normalize -> Deduplicate -> CMT relevance ->
+Full-text resolution -> Candidate` and the 06:00 Asia/Kolkata daily source
+scheduler (`app/worker/ist_scheduler.py` / `app/worker/scheduler.py`) are
+untouched (byte-identical diff). Nothing in this pass touches
+`app/worker/scheduler.py`, and the new Newsletter `publish-now` endpoint
+(item 8) is pure HTTP orchestration over existing transitions -- there is
+no second scheduler anywhere, so the IST source scheduler can never mix
+with Newsletter publication or RAG processing.
+
+### 2. Full-text acquisition -- approach unchanged; now exposed via API
+
+`app/services/fulltext/service.py`'s PDF -> XML -> HTML -> other chain is
+completely untouched (byte-identical diff against the previous delivery).
+What was missing was an API surface for it: added `GET
+/candidates/{id}/document` and `GET /documents/{id}` (new
+`app/api/routers/document.py`, new `app/services/document_service.py`,
+new `app/schemas/document.py`), returning exactly the fields the spec
+lists -- document id, candidate id, source URL, source format, extracted
+original full text, full-text availability, provenance/retrieval
+information, DOI/PMID, source metadata. `extracted_text` is populated
+**only** when `retrieval_status == "acquired"` and extraction succeeded
+(that's all `app/services/fulltext/service.py` ever sets it to) -- never a
+fallback to the abstract, so abstract-only material can never be
+represented as full text. This is structurally, permanently distinct from
+`app/api/routers/editorial.py` (the AI-generated Newsletter draft, flagged
+`is_ai_generated`): different tables, different endpoints, never merged.
+
+### 3. Candidate API -- contract frozen; both mismatches resolved, not guessed
+
+`GET /candidates` / `GET /candidates/{id}` are the existing, unchanged
+endpoints. Two documented resolutions (see `docs/API_CONTRACTS.md` for the
+full writeup):
+
+- **Pagination.** Canonical contract stays `limit`/`offset` (unchanged --
+  every other list endpoint in this engine already uses it, and the
+  response envelope always has `limit`/`offset`/`total`/`has_more`). As a
+  non-breaking addition, `GET /candidates` now ALSO accepts Veda's
+  `page`/`page_size`, converted to `limit`/`offset` internally before
+  anything else runs (`app/api/routers/candidates.py::list_candidates`).
+  A caller that keeps sending `limit`/`offset` is completely unaffected.
+- **Status terminology.** Canonical value stays `"drafted"` (renaming a
+  persisted, indexed state-machine value is a data-rewrite/state-machine
+  risk deliberately avoided here -- see the testing-approach note below).
+  Documented requirement for Veda-v1: display/compare against `"drafted"`,
+  not `"draft"`. As a non-breaking courtesy, `GET /candidates`'s
+  `newsletter_status` filter also accepts the alias `"draft"` and
+  normalizes it to `"drafted"` before filtering (`app/models/enums.py::
+  NEWSLETTER_STATUS_INPUT_ALIASES`) -- the alias is never stored and never
+  returned by any response.
+
+### 4. Candidate Workspace API -- new
+
+`GET /candidates/{id}/workspace` (new `app/api/routers/workspace.py`, new
+`app/schemas/workspace.py`) consolidates candidate + source metadata +
+latest CMT-relevance analysis + a lightweight document summary (no
+`extracted_text` -- see item 5) + current editorial draft + Newsletter
+item (including the new `section`) + a reference to Discovery's own
+`rag_ingestion_requests` tracking row + the 20 most recent audit entries,
+in a small fixed number of plain SELECTs (no per-row N+1 loop). Entirely
+read-only: it never calls `get_or_create_item`/an equivalent RAG
+get-or-create, so merely viewing a workspace never creates a
+NewsletterItem/RagIngestionRequest as a side effect.
+
+### 5. Original document/full-text API -- new
+
+Covered under item 2 above (`GET /candidates/{id}/document`, `GET
+/documents/{id}`). This is the endpoint Veda calls right before feeding
+Gemini for Newsletter drafting -- Discovery generates no Newsletter
+article itself, confirmed unchanged (`app/services/intelligence/
+editorial_service.py` byte-identical).
+
+### 6. Discovery remains authoritative -- no new document repository anywhere
+
+No new storage of scientific-document content was added in Veda-v1 (this
+task touched Discovery only). `discovery_documents` remains the single
+source of record for full text; the new endpoints are reads against it,
+not a copy of it.
+
+### 7. Newsletter-related backend support -- satisfied by items 2/4/5
+
+Discovery exposes source/full-text information via the document and
+workspace APIs; Gemini Newsletter generation stays entirely in Veda-v1 --
+nothing in `app/services/intelligence/` or `app/worker/handlers.py`'s
+`generate_editorial_draft` job changed.
+
+### 8. Newsletter publication scheduling -- mostly pre-existing; "Publish Now" added
+
+`approved -> scheduled -> published` and `scheduled -> approved`
+(cancel/reschedule) already existed and are unchanged
+(`app/services/workflows/newsletter_workflow.py::schedule/unschedule`,
+`app/api/routers/newsletter.py`'s existing granular routes + the
+`/candidates/{id}/schedule`, `DELETE .../schedule`, `/candidates/{id}/publish`
+CMT Veda compat routes). Added: `POST /candidates/{id}/newsletter/
+publish-now` -- explicit "Publish Now" from an `approved` item (spec's
+missing piece). **Zero new edges were added to `ALLOWED_TRANSITIONS`**:
+this is pure orchestration in the router over the exact same, unchanged
+`wf.schedule()` + `wf.publish()` functions, called back-to-back with
+`scheduled_for=now()`. An already-`scheduled` item is simply published
+immediately instead (same semantics `/candidates/{id}/publish` already
+has). Kept entirely separate from the 06:00 IST source scheduler (item 1).
+
+### 9. Persistent Newsletter distribution -- new `section` field
+
+Added `newsletter_items.section` (nullable string) + `PATCH
+/candidates/{id}/newsletter/section`. A pure metadata assignment
+(`newsletter_workflow.set_section()`) -- never touches
+`ALLOWED_TRANSITIONS`, callable at any status (an editor can pre-stage a
+destination before the item is even selected). Persisted server-side, so
+it survives a refresh or a different device/reviewer -- no longer
+browser-only state.
+
+### 10. Published Newsletter feed -- new
+
+`GET /newsletter/published` (section/limit/offset, newest-first by a new
+`newsletter_items.published_at` column set exactly once in
+`newsletter_workflow.publish()`). Built as exactly 2 queries regardless of
+page size: one joined `NewsletterItem`+`DiscoveryCandidate` query for the
+page, one bulk `WHERE candidate_id IN (...)` lookup of current editorial
+drafts for just that page -- never one draft query per item. See
+`docs/API_CONTRACTS.md` for the full response shape.
+
+### 11. Human approval -- unchanged; no Auto-Pilot
+
+Reconfirmed: the previous revision's repo-wide Auto-Pilot grep (see the
+section directly below) still returns zero matches, and nothing in this
+pass adds any automated approve/schedule/publish path. `publish-now`
+(item 8) still requires an authenticated admin principal and still only
+acts on a human-reached `approved`/`scheduled` state.
+
+### Database migrations
+
+`alembic/versions/0004_final_api_contract.py` -- two new, nullable,
+additive columns on `newsletter_items` (`section`, `published_at`), plus
+an index on `published_at`. No column renamed/dropped/retyped, no CHECK
+constraint anywhere in this schema needs touching (enums here are plain
+VARCHAR + application-level validation -- see `app/models/enums.py`'s
+module docstring), and both columns are safe to deploy ahead of app code
+that starts writing them.
+
+### Files changed/added (exact list)
+
+Changed: `app/models/enums.py`, `app/models/newsletter.py`,
+`app/services/workflows/newsletter_workflow.py`,
+`app/schemas/newsletter.py`, `app/api/routers/newsletter.py`,
+`app/api/routers/candidates.py`, `app/main.py`, `README.md`,
+`IMPLEMENTATION_STATUS.md`.
+
+Added: `alembic/versions/0004_final_api_contract.py`,
+`app/services/document_service.py`, `app/schemas/document.py`,
+`app/schemas/workspace.py`, `app/api/routers/document.py`,
+`app/api/routers/workspace.py`, `docs/API_CONTRACTS.md`,
+`tests/test_candidate_contract.py`, `tests/test_candidate_workspace.py`,
+`tests/test_document_api.py`, `tests/test_newsletter_publish_now.py`,
+`tests/test_newsletter_section.py`, `tests/test_newsletter_published_feed.py`.
+
+Nothing else changed -- confirmed by a full-repo diff against the
+previously delivered copy (every file not listed above is byte-identical).
+
+### Testing performed from this sandbox (standing constraint, unchanged across every pass in this engagement)
+
+No `pytest`/`sqlalchemy`/`fastapi` available here (network egress to
+PyPI is blocked at the organization-policy level from this sandbox, and
+no live VPS/database access exists at all) -- this is the same
+constraint noted in every prior section of this document. What WAS done
+here:
+
+1. A full repository `py_compile` sweep (clean) over every changed/added
+   file.
+2. A genuine execution harness: every new/changed `.py` file listed above
+   (enums, model, workflow, document_service, and all four router files)
+   loaded and executed **unmodified** via
+   `importlib.util.spec_from_file_location`, against lightweight
+   SQLAlchemy/FastAPI stand-ins (pydantic itself IS installed here, so
+   every `app/schemas/*.py` file involved loaded and ran for real, zero
+   stubbing). 46/46 checks passed, including: `publish-now` from both
+   `approved` and `scheduled` reaching `published` with zero new
+   `ALLOWED_TRANSITIONS` edges; the documented page/page_size <->
+   limit/offset math; the `draft`->`drafted` filter alias actually
+   matching real rows; the document-lookup's acquired-preferred,
+   `created_at`-ordered selection (deliberately tested with the rows
+   inserted out of order, to rule out an insertion-order coincidence);
+   the workspace aggregation picking the latest analysis/current draft
+   and never leaking one candidate's rows into another's; and the
+   published feed's exactly-2-queries-regardless-of-page-size claim,
+   counted directly by an instrumented fake session.
+3. New `tests/test_*.py` files written in the project's own `pytest` +
+   `app_client`/`db_session` fixture style (see `tests/conftest.py`), so
+   they run for real the moment this is deployed somewhere `pip install
+   -r requirements.txt && pytest` actually works -- they were NOT
+   themselves executed in this sandbox (no pytest here), which is
+   exactly why section 12 below asks you to run them as step 1 after
+   deploying.
+4. A full-repo diff against the previously delivered zip, confirming the
+   file list above is the complete and only set of changes -- in
+   particular that nothing under RAG (item 13) or the full-text resolver/
+   acquisition pipeline (item 2) was touched.
+
+### Live testing (could not be performed from this sandbox -- see `docs/API_CONTRACTS.md` for ready-to-run commands)
+
+Per item 12's testing approach, here is the section-by-section deploy-and-
+live-test sequence to run against your actual environment (this sandbox
+has no VPS/database access at all, standing constraint, unchanged since
+the very first revision of this document):
+
+1. `alembic upgrade head` (applies migration `0004`; confirm with
+   `\d newsletter_items` on Postgres that `section`/`published_at` exist).
+2. `pip install -r requirements.txt && pytest` -- runs the full suite
+   including the six new test files above.
+3. Restart the API process (worker does not need restarting -- nothing in
+   `app/worker/` changed).
+4. Smoke-test each new endpoint with the curl commands in
+   `docs/API_CONTRACTS.md`'s "Smoke test" section, against a real
+   candidate id.
+5. If anything comes back unexpected, it is a genuine integration finding
+   (this sandbox cannot pre-discover environment-specific issues like
+   live DNS/auth/Postgres version quirks) -- report it and it gets fixed
+   in a follow-up pass, same as every previous section of this document.
+
+### Veda-v1/Lovable-side requirements (handed off, not implemented here)
+
+See `docs/API_CONTRACTS.md`'s final section for the full list; in short:
+switch pagination to `limit`/`offset` (or keep using `page`/`page_size`,
+now accepted) on `GET /candidates`; display/compare against `"drafted"`,
+never `"draft"`; fetch full text from `GET /candidates/{id}/document`
+rather than ever treating `abstract` as full text; consume `GET
+/candidates/{id}/workspace` instead of reconstructing a candidate from
+several calls; and point the public Newsletter page at `GET
+/newsletter/published` instead of a candidate-by-candidate fetch loop.
+
+## Simplify Discovery Newsletter Workflow and Clean Dataset (previous revision)
 
 Four-part task, Discovery Engine only (Veda-v1/CMT Veda frontend untouched,
 confirmed): (1) remove Auto-Pilot, (2) clean the candidate dataset, (3)

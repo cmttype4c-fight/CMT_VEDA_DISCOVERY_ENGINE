@@ -19,6 +19,7 @@ from app.api.routers import (
     analysis,
     audit,
     candidates,
+    document,
     editorial,
     health,
     manual,
@@ -27,6 +28,7 @@ from app.api.routers import (
     rag,
     runs,
     sources,
+    workspace,
 )
 from app.config import get_settings
 from app.database import session_scope
@@ -53,7 +55,10 @@ app = FastAPI(
 # handlers, one OpenAPI schema, one /docs page (spec #55: stable,
 # documented request/response schemas for the future Lovable frontend).
 api_router = APIRouter(prefix=settings.api_prefix)
-for router in (sources, runs, candidates, analysis, editorial, newsletter, rag, manual, audit, overview):
+for router in (
+    sources, runs, candidates, analysis, editorial, newsletter, rag, manual, audit, overview,
+    document, workspace,
+):
     api_router.include_router(router.router)
 
 app.include_router(api_router)

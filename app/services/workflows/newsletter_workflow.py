@@ -216,7 +216,38 @@ def unschedule(db: Session, candidate: DiscoveryCandidate, performed_by: str) ->
 
 def publish(db: Session, candidate: DiscoveryCandidate, item: NewsletterItem, performed_by: str) -> NewsletterItem:
     _transition(item, candidate, NewsletterStatus.published.value)
+    # CMT Veda final-contract pass (spec item 10): `GET /newsletter/published`
+    # needs a stable "when was this actually published" moment to sort by.
+    # Set exactly once, here, at the single call site that ever performs
+    # this transition -- never touched again afterwards (not even by a
+    # later set_section() call), so it stays a true publish timestamp.
+    item.published_at = datetime.now(timezone.utc)
     write_audit_log(db, candidate_id=candidate.id, action=AuditAction.published, performed_by=performed_by)
+    return item
+
+
+def set_section(db: Session, candidate: DiscoveryCandidate, section: str, performed_by: str) -> NewsletterItem:
+    """
+    Persist the Newsletter section/destination for a candidate's item
+    (spec item 9 -- "persistent Newsletter distribution: the selected
+    Newsletter section/destination must not exist only in browser
+    state").
+
+    Deliberately NOT a state-machine transition: it never calls
+    `_transition`/touches `ALLOWED_TRANSITIONS`, never changes `status`,
+    and can be called at ANY status (including `not_selected`, so an
+    editor can pre-stage a destination before the item is even selected).
+    This is a plain metadata assignment, the same category of operation
+    as `mark_draft_saved_manually`'s `editorial_draft_id` association --
+    safe to call no matter what stage review has reached.
+    """
+    item = get_or_create_item(db, candidate)
+    old_section = item.section
+    item.section = section
+    write_audit_log(
+        db, candidate_id=candidate.id, action=AuditAction.section_assigned, performed_by=performed_by,
+        old_value={"section": old_section}, new_value={"section": section},
+    )
     return item
 
 

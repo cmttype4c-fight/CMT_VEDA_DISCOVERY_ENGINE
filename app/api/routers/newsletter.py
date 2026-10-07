@@ -18,14 +18,17 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_candidate_or_404, get_db
 from app.auth import Principal, require_admin, require_any_authenticated, require_reviewer_or_admin, require_service_or_admin
 from app.models.candidate import DiscoveryCandidate
+from app.models.editorial import DiscoveryEditorialDraft
 from app.models.enums import NewsletterStatus, Role
-from app.models.newsletter import NewsletterPublication
+from app.models.newsletter import NewsletterItem, NewsletterPublication
+from app.schemas.common import Page
 from app.schemas.newsletter import (
     BulkCandidateAction,
     BulkResult,
@@ -36,6 +39,8 @@ from app.schemas.newsletter import (
     NewsletterPublicationOut,
     NewsletterRejectRequest,
     NewsletterScheduleRequest,
+    NewsletterSectionUpdate,
+    PublishedNewsletterItemOut,
 )
 from app.services.workflows import newsletter_workflow as wf
 from app.services.workflows.newsletter_workflow import InvalidTransition
@@ -137,6 +142,184 @@ def archive_newsletter_item(
     db.commit()
     db.refresh(item)
     return item
+
+
+@router.patch("/candidates/{candidate_id}/newsletter/section", response_model=NewsletterItemOut)
+def set_newsletter_section(
+    payload: NewsletterSectionUpdate,
+    candidate: DiscoveryCandidate = Depends(get_candidate_or_404),
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(require_reviewer_or_admin),
+):
+    """
+    Final Functional Requirements, spec item 9: persist the Newsletter
+    section/destination for this candidate's item so it survives a page
+    refresh or a different device/reviewer, rather than only existing in
+    Veda's browser state. Pure metadata assignment -- see
+    `newsletter_workflow.set_section`'s docstring: never a state-machine
+    transition, callable at any status. Reviewer-or-admin, matching the
+    role boundary of `select`/`review` above (an editorial placement
+    decision, not a publish-affecting one).
+    """
+    item = wf.set_section(db, candidate, payload.section, principal.subject)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+@router.post("/candidates/{candidate_id}/newsletter/publish-now", response_model=NewsletterItemOut)
+def publish_now(
+    candidate: DiscoveryCandidate = Depends(get_candidate_or_404),
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(require_admin),
+):
+    """
+    Final Functional Requirements, spec item 8: "Explicit Publish Now
+    from an approved item should also be supported" -- in addition to
+    (not instead of) the existing approved -> scheduled -> published
+    path above and the existing scheduled -> approved cancellation edge
+    (`unschedule_newsletter_item`).
+
+    This endpoint adds ZERO new edges to `ALLOWED_TRANSITIONS`: it is
+    pure orchestration over the exact same `wf.schedule()` and
+    `wf.publish()` primitives the granular routes above already use,
+    just called back-to-back with `scheduled_for=now()` when starting
+    from `approved`. An item already `scheduled` (for some other time)
+    is simply published immediately instead -- the same "publish this
+    scheduled item right now" behavior `/candidates/{id}/publish` below
+    already provides, reached through one call instead of two. Anything
+    else (`not_selected`, `selected`, `drafted`, `under_review`,
+    `rejected`, `published`, `archived`) is rejected with 422, mirroring
+    `publish_candidate`'s existing guard.
+    """
+    from datetime import datetime, timezone
+
+    item = wf.get_or_create_item(db, candidate)
+    now = datetime.now(timezone.utc)
+
+    if item.status == NewsletterStatus.approved.value:
+        publication = NewsletterPublication(
+            title=f"Newsletter - {candidate.title[:80]}",
+            status="scheduled",
+            scheduled_for=now,
+            created_by=principal.subject,
+        )
+        db.add(publication)
+        db.flush()
+        item = _handle_transition(wf.schedule, db, candidate, principal.subject, now, publication)
+    elif item.status == NewsletterStatus.scheduled.value:
+        publications = db.execute(select(NewsletterPublication)).scalars().all()
+        publication = next((p for p in publications if str(item.id) in p.item_ids), None)
+        if publication is None:
+            # Defensive fallback: a scheduled item should always have been
+            # attached to a publication by wf.schedule(), but if one
+            # somehow isn't (e.g. legacy data), create one now rather than
+            # failing the publish -- the exact same ad-hoc-publication
+            # pattern `publish_candidate` below already relies on.
+            publication = NewsletterPublication(
+                title=f"Newsletter - {candidate.title[:80]}", status="scheduled",
+                scheduled_for=item.scheduled_for or now, created_by=principal.subject,
+                item_ids=[str(item.id)],
+            )
+            db.add(publication)
+            db.flush()
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Candidate must be 'approved' or 'scheduled' to publish now (currently '{item.status}').",
+        )
+
+    item = _handle_transition(wf.publish, db, candidate, item, principal.subject)
+    publication.status = "published"
+    publication.published_at = now
+    publication.published_by = principal.subject
+
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+@router.get("/newsletter/published", response_model=Page[PublishedNewsletterItemOut])
+def list_published(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    section: str | None = Query(None, description="Filter by the section/destination set via PATCH .../newsletter/section"),
+    db: Session = Depends(get_db),
+    _: Principal = Depends(require_any_authenticated),
+):
+    """
+    Final Functional Requirements, spec item 10: "a clean published-
+    content API for Veda ... enough information for Veda to render the
+    public Newsletter without an N+1 candidate-detail request pattern."
+
+    Exactly two queries regardless of page size: one joined
+    NewsletterItem+DiscoveryCandidate query for the page of published
+    items (newest-first by `published_at`), then one bulk lookup of every
+    current `DiscoveryEditorialDraft` for the candidate_ids on that page
+    (`WHERE candidate_id IN (...)`) -- never one draft query per item.
+
+    Candidate fields (title/authors/journal/doi/pmid/source_url) are the
+    original scientific source; `headline`/`summary`/`why_it_matters`/
+    `key_points` are the current editorial draft, which `is_ai_generated`
+    clearly marks as AI/editorial content, not the source itself (spec
+    item 2's distinguishability requirement).
+    """
+    query = (
+        select(NewsletterItem, DiscoveryCandidate)
+        .join(DiscoveryCandidate, DiscoveryCandidate.id == NewsletterItem.candidate_id)
+        .where(NewsletterItem.status == NewsletterStatus.published.value)
+    )
+    if section:
+        query = query.where(NewsletterItem.section == section)
+
+    all_rows = db.execute(query).all()
+    total = len(all_rows)
+
+    # Newest-first by published_at; a row somehow missing it (shouldn't
+    # happen going forward -- see newsletter_workflow.publish()) sorts
+    # last rather than crashing the comparison.
+    all_rows.sort(key=lambda row: row[0].published_at or row[1].discovered_at, reverse=True)
+    page_rows = all_rows[offset : offset + limit]
+
+    candidate_ids = [candidate.id for _item, candidate in page_rows]
+    current_drafts: dict[uuid.UUID, DiscoveryEditorialDraft] = {}
+    if candidate_ids:
+        draft_rows = db.execute(
+            select(DiscoveryEditorialDraft).where(
+                DiscoveryEditorialDraft.candidate_id.in_(candidate_ids),
+                DiscoveryEditorialDraft.is_current.is_(True),
+            )
+        ).scalars().all()
+        current_drafts = {draft.candidate_id: draft for draft in draft_rows}
+
+    items: list[PublishedNewsletterItemOut] = []
+    for item, candidate in page_rows:
+        draft = current_drafts.get(candidate.id)
+        items.append(
+            PublishedNewsletterItemOut(
+                candidate_id=candidate.id,
+                newsletter_item_id=item.id,
+                section=item.section,
+                published_at=item.published_at,
+                scheduled_for=item.scheduled_for,
+                title=candidate.title,
+                authors=candidate.authors or [],
+                journal=candidate.journal,
+                source_name=candidate.source_name,
+                source_url=candidate.source_url,
+                doi=candidate.doi,
+                pmid=candidate.pmid,
+                content_type=candidate.content_type,
+                full_text_available=candidate.full_text_available,
+                headline=draft.headline if draft else None,
+                summary=draft.summary if draft else None,
+                why_it_matters=draft.why_it_matters if draft else None,
+                key_points=draft.key_points if draft else [],
+                is_ai_generated=draft.is_ai_generated if draft else None,
+            )
+        )
+
+    return Page(items=items, total=total, limit=limit, offset=offset, has_more=offset + len(page_rows) < total)
 
 
 @router.post("/newsletter-publications", response_model=NewsletterPublicationOut, status_code=201)

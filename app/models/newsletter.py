@@ -41,8 +41,28 @@ class NewsletterItem(Base, TimestampMixin):
 
     scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # CMT Veda final-contract pass (spec item 9 -- "persistent Newsletter
+    # distribution: the selected Newsletter section/destination must not
+    # exist only in browser state"). Free-text editorial placement (e.g.
+    # "Research Digest", "Community Spotlight") set via
+    # newsletter_workflow.set_section() -- a pure metadata assignment, not
+    # a state-machine transition, so it can be set/changed at any status
+    # and never participates in ALLOWED_TRANSITIONS. Persisted here so it
+    # survives a page refresh/different device, per the spec's complaint.
+    section: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    # CMT Veda final-contract pass (spec item 10 -- "published-content API
+    # ... newest-first ordering"). Set once, in newsletter_workflow.publish(),
+    # the moment an item actually reaches `published`. Deliberately a
+    # dedicated column rather than reusing TimestampMixin.updated_at:
+    # updated_at changes on ANY later edit to this row (e.g. a `section`
+    # change after publication), which would silently reorder the public
+    # feed -- published_at is set exactly once and never touched again.
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     __table_args__ = (
         Index("ix_newsletter_items_status", "status"),
+        Index("ix_newsletter_items_published_at", "published_at"),
     )
 
 
